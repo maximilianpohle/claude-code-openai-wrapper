@@ -236,6 +236,7 @@ class TestChatCompletions:
         assert "Bash" in call["disallowed_tools"]
         assert call["permission_mode"] is None
         assert call["max_turns"] == 1
+        assert call["tools"] == []  # no built-in tools at all (deny-list is not enough)
 
     def test_tools_enabled_on_request(self, client, without_api_key, fake_claude):
         r = _chat(client, "Hallo", enable_tools=True)
@@ -243,6 +244,7 @@ class TestChatCompletions:
         call = fake_claude[0]
         assert "Bash" in call["allowed_tools"]
         assert call["disallowed_tools"] is None
+        assert call["tools"] is None  # default tool set
         assert call["permission_mode"] == "bypassPermissions"
 
     def test_permission_header_ignored_without_tools(self, client, without_api_key, fake_claude):
@@ -293,6 +295,7 @@ class TestAnthropicMessages:
         call = fake_claude[0]
         assert call["allowed_tools"] is None
         assert "Bash" in call["disallowed_tools"]
+        assert call["tools"] == []
         assert call["permission_mode"] is None
 
     def test_tools_enabled_with_header(self, client, without_api_key, fake_claude):

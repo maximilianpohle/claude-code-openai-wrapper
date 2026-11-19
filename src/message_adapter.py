@@ -16,13 +16,24 @@ class MessageAdapter:
         conversation_parts = []
 
         for message in messages:
+            content = message.content or ""
             if message.role == "system":
                 # Use the last system message as the system prompt
-                system_prompt = message.content
+                system_prompt = content
             elif message.role == "user":
-                conversation_parts.append(f"Human: {message.content}")
+                conversation_parts.append(f"Human: {content}")
             elif message.role == "assistant":
-                conversation_parts.append(f"Assistant: {message.content}")
+                text = f"Assistant: {content}" if content else "Assistant:"
+                for call in message.tool_calls or []:
+                    function = call.get("function", {})
+                    text += (
+                        f"\n[called function {function.get('name')} "
+                        f"(id {call.get('id')}) with arguments {function.get('arguments')}]"
+                    )
+                conversation_parts.append(text)
+            elif message.role == "tool":
+                label = f"id {message.tool_call_id}" if message.tool_call_id else message.name
+                conversation_parts.append(f"[Result of function call ({label})]:\n{content}")
 
         # Join conversation parts
         prompt = "\n\n".join(conversation_parts)

@@ -638,6 +638,7 @@ See `examples/session_continuity.py` for comprehensive Python examples and `exam
 - `GET /` - Interactive landing page with API explorer
 - `POST /v1/chat/completions` - OpenAI-compatible chat completions (supports `session_id`)
 - `POST /v1/messages` - Anthropic-compatible messages endpoint (non-streaming only; tools off unless header `X-Claude-Enable-Tools: true`)
+- Function calling on `POST /v1/chat/completions`: `tools`, `tool_choice` (`auto`/`none`/`required`/a named function) and `tool` messages are supported, streaming and non-streaming. Claude answers with `tool_calls` (emulated via structured output, so e.g. Elastic Attack Discovery / LangChain work). Claude Code's own tools (Bash, ...) stay disabled in this mode; `parallel_tool_calls` is accepted but not enforced.
 - `GET /v1/models` - List available models
 - `GET /v1/auth/status` - Check authentication status and configuration
 - `POST /v1/claude-login/start`, `POST /v1/claude-login/complete`, `GET`/`DELETE /v1/claude-login` - Claude subscription login via API

@@ -27,9 +27,13 @@ class ContentPart(BaseModel):
 
 
 class Message(BaseModel):
-    role: Literal["system", "user", "assistant"]
-    content: Union[str, List[ContentPart]]
+    role: Literal["system", "user", "assistant", "tool"]
+    # None is valid for assistant messages that only carry tool_calls
+    content: Optional[Union[str, List[ContentPart]]] = None
     name: Optional[str] = None
+    # OpenAI function calling: calls made by the assistant / id of the call a tool result answers
+    tool_calls: Optional[List[Dict[str, Any]]] = None
+    tool_call_id: Optional[str] = None
 
     @model_validator(mode="after")
     def normalize_content(self):
@@ -76,6 +80,16 @@ class ChatCompletionRequest(BaseModel):
     session_id: Optional[str] = Field(
         default=None, description="Optional session ID for conversation continuity"
     )
+    tools: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        description="OpenAI function definitions. Claude answers with tool_calls (emulated via "
+        "structured output); Claude Code's own tools stay disabled.",
+    )
+    tool_choice: Optional[Union[str, Dict[str, Any]]] = Field(
+        default=None,
+        description='"auto", "none", "required" or {"type":"function","function":{"name":...}}',
+    )
+    parallel_tool_calls: Optional[bool] = None
     enable_tools: Optional[bool] = Field(
         default=False,
         description="Enable Claude Code tools (Read, Write, Bash, etc.) - disabled by default for OpenAI compatibility",
@@ -206,7 +220,9 @@ class ChatCompletionRequest(BaseModel):
 class Choice(BaseModel):
     index: int
     message: Message
-    finish_reason: Optional[Literal["stop", "length", "content_filter", "null"]] = None
+    finish_reason: Optional[Literal["stop", "length", "content_filter", "tool_calls", "null"]] = (
+        None
+    )
 
 
 class Usage(BaseModel):
@@ -228,7 +244,9 @@ class ChatCompletionResponse(BaseModel):
 class StreamChoice(BaseModel):
     index: int
     delta: Dict[str, Any]
-    finish_reason: Optional[Literal["stop", "length", "content_filter", "null"]] = None
+    finish_reason: Optional[Literal["stop", "length", "content_filter", "tool_calls", "null"]] = (
+        None
+    )
 
 
 class ChatCompletionStreamResponse(BaseModel):

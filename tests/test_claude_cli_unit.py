@@ -604,6 +604,24 @@ class TestClaudeCodeCLIRunCompletion:
             assert captured_options[0].permission_mode == "acceptEdits"
 
     @pytest.mark.asyncio
+    async def test_run_completion_empty_tools_disables_builtin_tools(self, cli_instance):
+        """tools=[] is passed through (removes all built-in tools); None leaves the default."""
+        captured_options = []
+
+        async def mock_query(prompt, options):
+            captured_options.append(options)
+            yield {"type": "assistant"}
+
+        with patch("src.claude_cli.query", mock_query):
+            async for _ in cli_instance.run_completion("Hello", tools=[]):
+                pass
+            async for _ in cli_instance.run_completion("Hello"):
+                pass
+
+        assert captured_options[0].tools == []
+        assert captured_options[1].tools is None
+
+    @pytest.mark.asyncio
     async def test_run_completion_converts_objects_to_dicts(self, cli_instance):
         """run_completion converts message objects to dicts."""
         # Create a mock object with attributes

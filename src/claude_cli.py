@@ -97,6 +97,8 @@ class ClaudeCodeCLI:
         max_turns: int = 10,
         allowed_tools: Optional[List[str]] = None,
         disallowed_tools: Optional[List[str]] = None,
+        tools: Optional[List[str]] = None,
+        output_format: Optional[Dict[str, Any]] = None,
         permission_mode: Optional[str] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Run Claude Agent using the Python SDK and yield response chunks."""
@@ -124,6 +126,13 @@ class ClaudeCodeCLI:
                 options.allowed_tools = allowed_tools
             if disallowed_tools:
                 options.disallowed_tools = disallowed_tools
+            # [] removes ALL built-in tools. A deny-list alone is not enough: newer CLI
+            # versions add tools, and a call to one needs a second turn (max_turns=1 fails).
+            if tools is not None:
+                options.tools = tools
+            # JSON schema the final answer must match (used for function calling)
+            if output_format is not None:
+                options.output_format = output_format
 
             # Set permission mode (needed for tool execution in API context)
             if permission_mode:

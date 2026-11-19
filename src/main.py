@@ -46,6 +46,7 @@ from src.models import (
 )
 from src.claude_cli import ClaudeCodeCLI
 from src import claude_login
+from src import tool_calling
 from src.login_page import LOGIN_PAGE_HTML
 from src.message_adapter import MessageAdapter
 from src.auth import (
@@ -664,11 +665,13 @@ def apply_tool_policy(claude_options: Dict[str, Any], enable_tools: bool) -> Non
     if enable_tools:
         claude_options["allowed_tools"] = DEFAULT_ALLOWED_TOOLS
         claude_options.pop("disallowed_tools", None)
+        claude_options.pop("tools", None)  # default tool set
         # Headless API usage cannot answer permission prompts.
         claude_options["permission_mode"] = "bypassPermissions"
         logger.info(f"Tools enabled by client request: {DEFAULT_ALLOWED_TOOLS}")
     else:
         claude_options["disallowed_tools"] = CLAUDE_TOOLS
+        claude_options["tools"] = []  # no built-in tools at all
         claude_options.pop("allowed_tools", None)
         claude_options.pop("permission_mode", None)
         claude_options["max_turns"] = 1  # Single turn for Q&A
@@ -677,13 +680,19 @@ def apply_tool_policy(claude_options: Dict[str, Any], enable_tools: bool) -> Non
 
 def prepare_chat_call(
     request_body: ChatCompletionRequest, claude_headers: Dict[str, Any]
-) -> Tuple[Dict[str, Any], Optional[str]]:
+) -> Tuple[Dict[str, Any], Optional[str], Optional[tool_calling.ToolSpec]]:
     """
     Build the run_completion() arguments for a chat request.
 
-    Returns (run_kwargs, session_id). The user's prompt is passed through unchanged;
-    only Claude's *output* is filtered.
+    Returns (run_kwargs, session_id, tool_spec). The user's prompt is passed through
+    unchanged; only Claude's *output* is filtered. tool_spec is set when the client sent
+    OpenAI `tools` (function calling), see src/tool_calling.py.
     """
+    try:
+        tool_spec = tool_calling.build_tool_spec(request_body.tools, request_body.tool_choice)
+    except tool_calling.ToolCallingError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     all_messages, session_id = session_manager.process_messages(
         request_body.messages, request_body.session_id
     )
@@ -700,11 +709,22 @@ def prepare_chat_call(
         )
         logger.debug(f"Added sampling instructions: {sampling_instructions}")
 
+    if tool_spec:
+        system_prompt = (
+            f"{system_prompt}\n\n{tool_spec.instructions}"
+            if system_prompt
+            else tool_spec.instructions
+        )
+
     claude_options = request_body.to_claude_options()
     claude_options.update(claude_headers)
     if claude_options.get("model"):
         ParameterValidator.validate_model(claude_options["model"])
-    apply_tool_policy(claude_options, bool(request_body.enable_tools))
+    # Client-side function calling never combines with Claude Code's own tools
+    apply_tool_policy(claude_options, bool(request_body.enable_tools) and not tool_spec)
+    if tool_spec:
+        # Structured output may need one more turn than a plain answer
+        claude_options["max_turns"] = 3
 
     run_kwargs = {
         "prompt": prompt,
@@ -713,9 +733,72 @@ def prepare_chat_call(
         "max_turns": claude_options.get("max_turns", 10),
         "allowed_tools": claude_options.get("allowed_tools"),
         "disallowed_tools": claude_options.get("disallowed_tools"),
+        "tools": claude_options.get("tools"),
         "permission_mode": claude_options.get("permission_mode"),
     }
-    return run_kwargs, session_id
+    if tool_spec:
+        run_kwargs["output_format"] = {"type": "json_schema", "schema": tool_spec.output_schema}
+    return run_kwargs, session_id, tool_spec
+
+
+async def run_tool_call(
+    run_kwargs: Dict[str, Any], tool_spec: tool_calling.ToolSpec
+) -> Tuple[Optional[str], List[Dict[str, Any]]]:
+    """Run Claude and translate its structured answer into (content, tool_calls)."""
+    chunks = []
+    async for chunk in claude_cli.run_completion(**run_kwargs, stream=False):
+        chunks.append(chunk)
+    structured = next(
+        (c["structured_output"] for c in chunks if c.get("structured_output") is not None), None
+    )
+    text = claude_cli.parse_claude_message(chunks)
+    try:
+        return tool_calling.parse_response(structured, text, tool_spec)
+    except tool_calling.ToolCallingError as e:
+        logger.warning(f"Function calling failed: {e}. Claude answered: {(text or '')[:300]!r}")
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+async def generate_tool_streaming_response(
+    request: ChatCompletionRequest,
+    request_id: str,
+    run_kwargs: Dict[str, Any],
+    tool_spec: tool_calling.ToolSpec,
+    actual_session_id: Optional[str],
+) -> AsyncGenerator[str, None]:
+    """SSE for function calling: the answer is computed first, then sent as chunks."""
+
+    def sse(delta: Dict[str, Any], finish_reason: Optional[str] = None) -> str:
+        chunk = ChatCompletionStreamResponse(
+            id=request_id,
+            model=request.model,
+            choices=[StreamChoice(index=0, delta=delta, finish_reason=finish_reason)],
+        )
+        return f"data: {chunk.model_dump_json()}\n\n"
+
+    try:
+        content, tool_calls = await run_tool_call(run_kwargs, tool_spec)
+        if tool_calls:
+            yield sse({"role": "assistant", "content": None})
+            for index, call in enumerate(tool_calls):
+                yield sse({"tool_calls": [{"index": index, **call}]})
+            finish = "tool_calls"
+        else:
+            yield sse({"role": "assistant", "content": content or ""})
+            finish = "stop"
+        if actual_session_id:
+            session_manager.add_assistant_response(
+                actual_session_id,
+                Message(role="assistant", content=content, tool_calls=tool_calls or None),
+            )
+        yield sse({}, finish)
+        yield "data: [DONE]\n\n"
+    except Exception as e:
+        logger.exception(f"Tool streaming error [{request_id}]: {e}")
+        message = (
+            e.detail if isinstance(e, HTTPException) else f"Internal server error ({request_id})"
+        )
+        yield f"data: {json.dumps({'error': {'message': message, 'type': 'streaming_error'}})}\n\n"
 
 
 def internal_error(request: Request, exc: Exception, context: str) -> HTTPException:
@@ -932,7 +1015,43 @@ async def chat_completions(
             compatibility_report = CompatibilityReporter.generate_compatibility_report(request_body)
             logger.debug(f"Compatibility report: {compatibility_report}")
 
-        run_kwargs, actual_session_id = prepare_chat_call(request_body, claude_headers)
+        run_kwargs, actual_session_id, tool_spec = prepare_chat_call(request_body, claude_headers)
+
+        if tool_spec and request_body.stream:
+            return StreamingResponse(
+                generate_tool_streaming_response(
+                    request_body, request_id, run_kwargs, tool_spec, actual_session_id
+                ),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+            )
+        if tool_spec:
+            content, tool_calls = await run_tool_call(run_kwargs, tool_spec)
+            if actual_session_id:
+                session_manager.add_assistant_response(
+                    actual_session_id,
+                    Message(role="assistant", content=content, tool_calls=tool_calls or None),
+                )
+            prompt_tokens = MessageAdapter.estimate_tokens(run_kwargs["prompt"])
+            completion_tokens = MessageAdapter.estimate_tokens(content or json.dumps(tool_calls))
+            return ChatCompletionResponse(
+                id=request_id,
+                model=request_body.model,
+                choices=[
+                    Choice(
+                        index=0,
+                        message=Message(
+                            role="assistant", content=content, tool_calls=tool_calls or None
+                        ),
+                        finish_reason="tool_calls" if tool_calls else "stop",
+                    )
+                ],
+                usage=Usage(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=prompt_tokens + completion_tokens,
+                ),
+            )
 
         if request_body.stream:
             return StreamingResponse(
@@ -1062,6 +1181,7 @@ async def anthropic_messages(
             max_turns=claude_options["max_turns"],
             allowed_tools=claude_options.get("allowed_tools"),
             disallowed_tools=claude_options.get("disallowed_tools"),
+            tools=claude_options.get("tools"),
             permission_mode=claude_options.get("permission_mode"),
             stream=False,
         ):
