@@ -37,6 +37,7 @@ TOKEN_FILE = Path(
 LOGIN_TIMEOUT_SECONDS = 600  # an unfinished login is discarded after 10 minutes
 URL_WAIT_SECONDS = 30
 TOKEN_WAIT_SECONDS = 60
+PASTE_SETTLE_SECONDS = 0.5  # pause between pasting the code and pressing Enter
 
 # Terminal control sequences (colors, cursor movement). Replaced by a space, because the
 # CLI's UI positions words with cursor moves instead of literal spaces.
@@ -48,6 +49,11 @@ _TOKEN_OR_ERROR = re.compile(f"{_TOKEN.pattern}|{_ERROR.pattern}")
 
 # Token passed in via environment (e.g. docker-compose); restored on logout
 _ENV_TOKEN_AT_STARTUP = os.getenv(TOKEN_ENV)
+
+
+def _redact(text: str) -> str:
+    """Mask anything token-like before it goes to a log."""
+    return re.sub(r"sk-ant-\S+", "[REDACTED]", text)
 
 
 class LoginError(Exception):
@@ -123,7 +129,14 @@ class _LoginProcess:
         return match.group(0) if match else None
 
     def send_line(self, line: str) -> None:
-        os.write(self.fd, line.encode() + b"\r")
+        """
+        Type `line` and press Enter. Enter must arrive as its own write: the CLI's input
+        field treats a multi-character chunk as pasted text, so an Enter inside the same
+        chunk would be swallowed and the (long) code never submitted.
+        """
+        os.write(self.fd, line.encode())
+        time.sleep(PASTE_SETTLE_SECONDS)
+        os.write(self.fd, b"\r")
 
     def close(self) -> None:
         if self.proc.poll() is None:
@@ -197,14 +210,15 @@ async def complete_login(code: str) -> None:
             _discard_current()
             raise LoginError("Login expired. Call /v1/claude-login/start again.")
         since = len(process.text)
-        process.send_line(code.strip())
+        await asyncio.to_thread(process.send_line, code.strip())
         result = await asyncio.to_thread(
             process.wait_for, _TOKEN_OR_ERROR, TOKEN_WAIT_SECONDS, since
         )
+        output = _redact(process.text[since:])
         _discard_current()
         if not result or not _TOKEN.fullmatch(result):
             reason = result or "no answer from Claude CLI"
-            logger.warning(f"Claude login failed: {reason}")
+            logger.warning(f"Claude login failed: {reason}. CLI output: {output[-500:]}")
             raise LoginError(f"Login failed ({reason}). Call /v1/claude-login/start again.")
         store_token(result)
         logger.info("Claude login completed via API")
