@@ -74,7 +74,12 @@ DEFAULT_DISALLOWED_TOOLS = [
 # Operators can override the advertised model list without rebuilding the image:
 #   CLAUDE_MODELS_OVERRIDE=claude-sonnet-4-6,claude-opus-4-6
 DEFAULT_CLAUDE_MODELS = [
-    # Claude 4.6 Family (Latest) - RECOMMENDED
+    # Claude 5 Family (Latest)
+    "claude-fable-5-2",  # Fable 5.2
+    "claude-opus-5-5",  # Opus 5.5 - most capable
+    "claude-sonnet-5-5",  # Sonnet 5.5
+    "claude-haiku-5-5",  # Haiku 5.5 - fast and cheap
+    # Claude 4.6 Family
     "claude-opus-4-6",  # Most capable
     "claude-sonnet-4-6",  # Recommended - best coding model
     # Claude 4.5 Family (Fall 2025)
