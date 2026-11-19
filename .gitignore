@@ -52,7 +52,7 @@ PARAMETER_MAPPING.md
 IMPROVEMENT_PLAN.md
 
 # Debug and temporary test files
-debug_*.py
+/debug_*.py
 test_debug_*.py
 test_performance_*.py
 test_user_*.py
