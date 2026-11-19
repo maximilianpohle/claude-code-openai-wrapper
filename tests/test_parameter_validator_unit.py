@@ -35,146 +35,6 @@ class TestParameterValidatorValidateModel:
             assert ParameterValidator.validate_model(model) is True
 
 
-class TestParameterValidatorValidatePermissionMode:
-    """Test ParameterValidator.validate_permission_mode()"""
-
-    def test_valid_permission_mode_default(self):
-        """'default' permission mode is valid."""
-        assert ParameterValidator.validate_permission_mode("default") is True
-
-    def test_valid_permission_mode_accept_edits(self):
-        """'acceptEdits' permission mode is valid."""
-        assert ParameterValidator.validate_permission_mode("acceptEdits") is True
-
-    def test_valid_permission_mode_bypass(self):
-        """'bypassPermissions' permission mode is valid."""
-        assert ParameterValidator.validate_permission_mode("bypassPermissions") is True
-
-    def test_invalid_permission_mode_returns_false(self):
-        """Invalid permission mode returns False with error logged."""
-        with patch("src.parameter_validator.logger") as mock_logger:
-            result = ParameterValidator.validate_permission_mode("invalidMode")
-            assert result is False
-            mock_logger.error.assert_called_once()
-            assert "invalidMode" in str(mock_logger.error.call_args)
-
-
-class TestParameterValidatorValidateTools:
-    """Test ParameterValidator.validate_tools()"""
-
-    def test_valid_tools_list(self):
-        """List of valid tool names returns True."""
-        tools = ["Read", "Write", "Bash"]
-        assert ParameterValidator.validate_tools(tools) is True
-
-    def test_empty_string_tool_returns_false(self):
-        """Tool list with empty string returns False."""
-        with patch("src.parameter_validator.logger") as mock_logger:
-            result = ParameterValidator.validate_tools(["Read", "", "Bash"])
-            assert result is False
-            mock_logger.error.assert_called_once()
-
-    def test_whitespace_only_tool_returns_false(self):
-        """Tool list with whitespace-only string returns False."""
-        with patch("src.parameter_validator.logger") as mock_logger:
-            result = ParameterValidator.validate_tools(["Read", "   ", "Bash"])
-            assert result is False
-            mock_logger.error.assert_called_once()
-
-    def test_non_string_tool_returns_false(self):
-        """Tool list with non-string element returns False."""
-        with patch("src.parameter_validator.logger") as mock_logger:
-            result = ParameterValidator.validate_tools(["Read", 123, "Bash"])
-            assert result is False
-            mock_logger.error.assert_called_once()
-
-    def test_empty_list_returns_true(self):
-        """Empty tool list returns True (no invalid tools)."""
-        assert ParameterValidator.validate_tools([]) is True
-
-
-class TestParameterValidatorCreateEnhancedOptions:
-    """Test ParameterValidator.create_enhanced_options()"""
-
-    @pytest.fixture
-    def basic_request(self):
-        """Create a basic chat completion request for testing."""
-        return ChatCompletionRequest(
-            model="claude-sonnet-4-5-20250929",
-            messages=[Message(role="user", content="Hello")],
-        )
-
-    def test_basic_options_from_request(self, basic_request):
-        """Basic request options are extracted correctly."""
-        options = ParameterValidator.create_enhanced_options(basic_request)
-        assert "model" in options
-        assert options["model"] == "claude-sonnet-4-5-20250929"
-
-    def test_max_turns_added_when_provided(self, basic_request):
-        """max_turns is added to options when provided."""
-        options = ParameterValidator.create_enhanced_options(basic_request, max_turns=5)
-        assert options.get("max_turns") == 5
-
-    def test_max_turns_warning_for_out_of_range(self, basic_request):
-        """Warning logged when max_turns is out of recommended range."""
-        with patch("src.parameter_validator.logger") as mock_logger:
-            # Test value below range
-            ParameterValidator.create_enhanced_options(basic_request, max_turns=0)
-            mock_logger.warning.assert_called()
-
-            mock_logger.reset_mock()
-
-            # Test value above range
-            ParameterValidator.create_enhanced_options(basic_request, max_turns=150)
-            mock_logger.warning.assert_called()
-
-    def test_allowed_tools_added_when_valid(self, basic_request):
-        """allowed_tools is added when valid tools provided."""
-        tools = ["Read", "Write"]
-        options = ParameterValidator.create_enhanced_options(basic_request, allowed_tools=tools)
-        assert options.get("allowed_tools") == tools
-
-    def test_disallowed_tools_added_when_valid(self, basic_request):
-        """disallowed_tools is added when valid tools provided."""
-        tools = ["Bash", "Edit"]
-        options = ParameterValidator.create_enhanced_options(basic_request, disallowed_tools=tools)
-        assert options.get("disallowed_tools") == tools
-
-    def test_permission_mode_added_when_valid(self, basic_request):
-        """permission_mode is added when valid mode provided."""
-        options = ParameterValidator.create_enhanced_options(
-            basic_request, permission_mode="acceptEdits"
-        )
-        assert options.get("permission_mode") == "acceptEdits"
-
-    def test_permission_mode_not_added_when_invalid(self, basic_request):
-        """permission_mode is not added when invalid mode provided."""
-        options = ParameterValidator.create_enhanced_options(
-            basic_request, permission_mode="invalidMode"
-        )
-        assert "permission_mode" not in options
-
-    def test_max_thinking_tokens_added(self, basic_request):
-        """max_thinking_tokens is added when provided."""
-        options = ParameterValidator.create_enhanced_options(
-            basic_request, max_thinking_tokens=5000
-        )
-        assert options.get("max_thinking_tokens") == 5000
-
-    def test_max_thinking_tokens_warning_for_out_of_range(self, basic_request):
-        """Warning logged when max_thinking_tokens is out of range."""
-        with patch("src.parameter_validator.logger") as mock_logger:
-            # Test negative value
-            ParameterValidator.create_enhanced_options(basic_request, max_thinking_tokens=-100)
-            mock_logger.warning.assert_called()
-
-            mock_logger.reset_mock()
-
-            # Test value above range
-            ParameterValidator.create_enhanced_options(basic_request, max_thinking_tokens=60000)
-            mock_logger.warning.assert_called()
-
-
 class TestParameterValidatorExtractClaudeHeaders:
     """Test ParameterValidator.extract_claude_headers()"""
 
@@ -188,6 +48,18 @@ class TestParameterValidatorExtractClaudeHeaders:
         headers = {"x-claude-max-turns": "10"}
         result = ParameterValidator.extract_claude_headers(headers)
         assert result.get("max_turns") == 10
+
+    def test_max_turns_is_clamped(self):
+        """X-Claude-Max-Turns is bounded to 1..MAX_TURNS_LIMIT."""
+        limit = ParameterValidator.MAX_TURNS_LIMIT
+        assert (
+            ParameterValidator.extract_claude_headers({"x-claude-max-turns": "100000"})["max_turns"]
+            == limit
+        )
+        assert (
+            ParameterValidator.extract_claude_headers({"x-claude-max-turns": "-5"})["max_turns"]
+            == 1
+        )
 
     def test_invalid_max_turns_logs_warning(self):
         """Invalid X-Claude-Max-Turns logs warning and is ignored."""

@@ -56,23 +56,6 @@ class TestParameterValidatorProperties:
         result = ParameterValidator.validate_model(model)
         assert result is True
 
-    @given(permission_mode=st.sampled_from(["default", "acceptEdits", "bypassPermissions", "plan"]))
-    @settings(max_examples=10)
-    def test_valid_permission_modes_accepted(self, permission_mode: str):
-        """Valid permission modes should be accepted."""
-        result = ParameterValidator.validate_permission_mode(permission_mode)
-        assert result is True
-
-    @given(permission_mode=st.text(min_size=1, max_size=30))
-    @settings(max_examples=20)
-    def test_invalid_permission_modes_rejected(self, permission_mode: str):
-        """Invalid permission modes should be rejected."""
-        valid_modes = {"default", "acceptEdits", "bypassPermissions", "plan"}
-        assume(permission_mode not in valid_modes)
-
-        result = ParameterValidator.validate_permission_mode(permission_mode)
-        assert result is False
-
 
 class TestTokenEstimation:
     """Property-based tests for token estimation consistency."""

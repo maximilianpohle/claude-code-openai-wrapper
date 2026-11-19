@@ -3,7 +3,7 @@ Parameter validation and mapping utilities for OpenAI to Claude Code SDK convers
 """
 
 import logging
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any
 from src.models import ChatCompletionRequest
 from src.constants import CLAUDE_MODELS
 
@@ -19,6 +19,9 @@ class ParameterValidator:
     # Valid permission modes for Claude Code SDK
     VALID_PERMISSION_MODES = {"default", "acceptEdits", "bypassPermissions", "plan"}
 
+    # Upper bound for X-Claude-Max-Turns
+    MAX_TURNS_LIMIT = 50
+
     @classmethod
     def validate_model(cls, model: str) -> bool:
         """Validate that the model is supported by Claude Code SDK."""
@@ -28,70 +31,6 @@ class ParameterValidator:
             )
             # Return True anyway to allow graceful degradation
         return True
-
-    @classmethod
-    def validate_permission_mode(cls, permission_mode: str) -> bool:
-        """Validate permission mode parameter."""
-        if permission_mode not in cls.VALID_PERMISSION_MODES:
-            logger.error(
-                f"Invalid permission_mode '{permission_mode}'. Valid options: {cls.VALID_PERMISSION_MODES}"
-            )
-            return False
-        return True
-
-    @classmethod
-    def validate_tools(cls, tools: List[str]) -> bool:
-        """Validate tool names (basic validation for non-empty strings)."""
-        if not all(isinstance(tool, str) and tool.strip() for tool in tools):
-            logger.error("All tool names must be non-empty strings")
-            return False
-        return True
-
-    @classmethod
-    def create_enhanced_options(
-        cls,
-        request: ChatCompletionRequest,
-        max_turns: Optional[int] = None,
-        allowed_tools: Optional[List[str]] = None,
-        disallowed_tools: Optional[List[str]] = None,
-        permission_mode: Optional[str] = None,
-        max_thinking_tokens: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """
-        Create enhanced Claude Code SDK options with additional parameters.
-
-        This allows API users to pass Claude-Code-specific parameters that don't
-        exist in the OpenAI API through custom headers or environment variables.
-        """
-        # Start with basic options from request
-        options = request.to_claude_options()
-
-        # Add Claude Code SDK specific options
-        if max_turns is not None:
-            if max_turns < 1 or max_turns > 100:
-                logger.warning(f"max_turns={max_turns} is outside recommended range (1-100)")
-            options["max_turns"] = max_turns
-
-        if allowed_tools:
-            if cls.validate_tools(allowed_tools):
-                options["allowed_tools"] = allowed_tools
-
-        if disallowed_tools:
-            if cls.validate_tools(disallowed_tools):
-                options["disallowed_tools"] = disallowed_tools
-
-        if permission_mode:
-            if cls.validate_permission_mode(permission_mode):
-                options["permission_mode"] = permission_mode
-
-        if max_thinking_tokens is not None:
-            if max_thinking_tokens < 0 or max_thinking_tokens > 50000:
-                logger.warning(
-                    f"max_thinking_tokens={max_thinking_tokens} is outside recommended range (0-50000)"
-                )
-            options["max_thinking_tokens"] = max_thinking_tokens
-
-        return options
 
     @classmethod
     def extract_claude_headers(cls, headers: Dict[str, str]) -> Dict[str, Any]:
@@ -108,7 +47,9 @@ class ParameterValidator:
         # Extract max_turns
         if "x-claude-max-turns" in headers:
             try:
-                claude_options["max_turns"] = int(headers["x-claude-max-turns"])
+                requested = int(headers["x-claude-max-turns"])
+                # Bound agent loops so one header cannot burn through the quota.
+                claude_options["max_turns"] = min(max(requested, 1), cls.MAX_TURNS_LIMIT)
             except ValueError:
                 logger.warning(
                     f"Invalid X-Claude-Max-Turns header: {headers['x-claude-max-turns']}"

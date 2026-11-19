@@ -304,6 +304,19 @@ RATE_LIMIT_HEALTH_PER_MINUTE=30
 
 Build and run the wrapper in a Docker container.
 
+### Prebuilt image
+
+The [Docker workflow](.github/workflows/docker.yml) publishes images (linux/amd64 + arm64) to the
+GitHub Container Registry on every push to `main` (`:latest`, `:main`) and on version tags
+`v1.2.3` (`:1.2.3`, `:1.2`, `:1`):
+
+```bash
+docker pull ghcr.io/<github-owner>/claude-code-openai-wrapper:latest
+```
+
+New packages on ghcr.io are private by default - make it public under the repository's
+*Packages* settings, or `docker login ghcr.io` with a token that has `read:packages`.
+
 ### Build
 
 ```bash
@@ -312,18 +325,49 @@ docker build -t claude-wrapper:latest .
 
 ### Run
 
+`-p 127.0.0.1:8000:8000` makes the server reachable only from this machine. To expose it on the
+network, set `-e API_KEY=<self-chosen secret>` (e.g. `openssl rand -hex 32`) and use `-p 8000:8000`.
+Without `API_KEY` every endpoint is open to anyone who can reach the port.
+
+**Claude login via the API (no `~/.claude` mount, no browser in the container):**
+
+Easiest: open **http://localhost:8000/claude-login** - click "Mit Claude anmelden", sign in in the
+new tab, paste the code shown there and click "Abschließen". (With `API_KEY` set, the browser asks
+for a login: any username, the API key as password.) The same flow for scripts:
+
+```bash
+# 1. Start the login - returns "authorize_url"
+curl -X POST http://localhost:8000/v1/claude-login/start
+# 2. Open authorize_url in any browser, sign in with your Claude account, copy the code shown
+# 3. Send the code within 10 minutes - the token is stored and used immediately
+curl -X POST http://localhost:8000/v1/claude-login/complete \
+  -H "Content-Type: application/json" -d '{"code": "<code from browser>"}'
+# Status / logout
+curl http://localhost:8000/v1/claude-login
+curl -X DELETE http://localhost:8000/v1/claude-login
+```
+
+(With `API_KEY` set, add `-H "Authorization: Bearer $API_KEY"`.) The endpoints run the bundled
+`claude setup-token` inside the container. The long-lived token is stored in
+`/home/app/.claude-wrapper/oauth_token` (mode 600) and is never returned by the API - mount a
+volume there (`claude-auth` below) so it survives container re-creation.
+
+Alternatives: run `claude setup-token` yourself and set `CLAUDE_CODE_OAUTH_TOKEN=<token>` in `.env`
+(gitignored, excluded from the image), or set `ANTHROPIC_API_KEY` / Bedrock / Vertex variables.
+A token from an API login takes precedence over `CLAUDE_CODE_OAUTH_TOKEN`.
+
 **Production:**
 ```bash
-docker run -d -p 8000:8000 \
-  -v ~/.claude:/root/.claude \
+docker run -d -p 127.0.0.1:8000:8000 \
+  -v claude-auth:/home/app/.claude-wrapper \
   --name claude-wrapper \
   claude-wrapper:latest
 ```
 
 **With custom workspace:**
 ```bash
-docker run -d -p 8000:8000 \
-  -v ~/.claude:/root/.claude \
+docker run -d -p 127.0.0.1:8000:8000 \
+  -v claude-auth:/home/app/.claude-wrapper \
   -v /path/to/project:/workspace \
   -e CLAUDE_CWD=/workspace \
   claude-wrapper:latest
@@ -331,11 +375,11 @@ docker run -d -p 8000:8000 \
 
 **Development (hot reload):**
 ```bash
-docker run -d -p 8000:8000 \
-  -v ~/.claude:/root/.claude \
+docker run -d -p 127.0.0.1:8000:8000 \
+  -v claude-auth:/home/app/.claude-wrapper \
   -v $(pwd):/app \
   claude-wrapper:latest \
-  poetry run uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
+  uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 ### Docker Compose
@@ -346,13 +390,18 @@ services:
   claude-wrapper:
     build: .
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     volumes:
-      - ~/.claude:/root/.claude
+      - claude-auth:/home/app/.claude-wrapper
     environment:
       - PORT=8000
       - MAX_TIMEOUT=600
+      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}
+      - API_KEY=${API_KEY:-}
     restart: unless-stopped
+
+volumes:
+  claude-auth:
 ```
 
 Run: `docker-compose up -d` | Stop: `docker-compose down`
@@ -366,7 +415,7 @@ Run: `docker-compose up -d` | Stop: `docker-compose down`
 | `CLAUDE_CWD` | Working directory | temp dir |
 | `CLAUDE_AUTH_METHOD` | Auth method: `cli`, `api_key`, `bedrock`, `vertex` | auto-detect |
 | `ANTHROPIC_API_KEY` | Direct Anthropic API key. Optional — also unlocks live `/v1/models` discovery and dynamic latest-Sonnet default. Not required when using Bedrock, Vertex, or Claude CLI subscription auth. | - |
-| `API_KEYS` | Comma-separated client API keys | - |
+| `API_KEY` | Self-chosen secret that clients must send as `Authorization: Bearer <key>`. Also protects `/docs`, `/redoc`, `/openapi.json` (browser login: any username, key as password). Unset = no protection. | - |
 | `DEFAULT_MODEL` | Override the default model. When unset and `ANTHROPIC_API_KEY` is configured, the wrapper resolves the latest Sonnet at startup; otherwise falls back to `claude-sonnet-4-6`. | auto |
 | `FAST_MODEL` | Speed/cost-optimized model alias. | `claude-haiku-4-5-20251001` |
 | `CLAUDE_MODELS_OVERRIDE` | Comma-separated model IDs to advertise via `/v1/models`. Takes precedence over both live and static lists. | - |
@@ -588,9 +637,10 @@ See `examples/session_continuity.py` for comprehensive Python examples and `exam
 ### Core Endpoints
 - `GET /` - Interactive landing page with API explorer
 - `POST /v1/chat/completions` - OpenAI-compatible chat completions (supports `session_id`)
-- `POST /v1/messages` - Anthropic-compatible messages endpoint
+- `POST /v1/messages` - Anthropic-compatible messages endpoint (non-streaming only; tools off unless header `X-Claude-Enable-Tools: true`)
 - `GET /v1/models` - List available models
 - `GET /v1/auth/status` - Check authentication status and configuration
+- `POST /v1/claude-login/start`, `POST /v1/claude-login/complete`, `GET`/`DELETE /v1/claude-login` - Claude subscription login via API
 - `GET /version` - Get API version
 - `GET /health` - Health check endpoint
 
@@ -672,6 +722,9 @@ The test suite automatically detects whether API key protection is enabled and p
 Check authentication status:
 ```bash
 curl http://localhost:8000/v1/auth/status | python -m json.tool
+
+# If API_KEY is set, send it as Bearer token:
+curl -H "Authorization: Bearer $API_KEY" http://localhost:8000/v1/auth/status | python -m json.tool
 ```
 
 ### ⚙️ **Development Tools**

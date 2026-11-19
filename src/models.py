@@ -434,6 +434,12 @@ class AnthropicMessage(BaseModel):
     content: Union[str, List[AnthropicTextBlock]]
 
 
+class ClaudeLoginCompleteRequest(BaseModel):
+    """Code shown by claude.com after signing in (format: code#state)."""
+
+    code: str = Field(..., min_length=1, max_length=2000)
+
+
 class AnthropicMessagesRequest(BaseModel):
     """Anthropic Messages API request format."""
 

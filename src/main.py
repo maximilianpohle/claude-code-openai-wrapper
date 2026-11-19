@@ -6,13 +6,15 @@ import secrets
 import string
 import time
 import uuid
-from typing import Optional, AsyncGenerator, Dict, Any, List
+from urllib.parse import urlparse
+from typing import Optional, AsyncGenerator, Dict, Any, List, Tuple
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.security import HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
+from fastapi.openapi.docs import get_swagger_ui_html, get_redoc_html
 from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
 import httpx
@@ -35,6 +37,7 @@ from src.models import (
     MCPServerInfoResponse,
     MCPServersListResponse,
     MCPConnectionRequest,
+    ClaudeLoginCompleteRequest,
     # Anthropic API compatible models
     AnthropicMessagesRequest,
     AnthropicMessagesResponse,
@@ -42,8 +45,17 @@ from src.models import (
     AnthropicUsage,
 )
 from src.claude_cli import ClaudeCodeCLI
+from src import claude_login
+from src.login_page import LOGIN_PAGE_HTML
 from src.message_adapter import MessageAdapter
-from src.auth import verify_api_key, security, validate_claude_code_auth, get_claude_code_auth_info
+from src.auth import (
+    verify_api_key,
+    verify_docs_access,
+    redact_headers,
+    security,
+    validate_claude_code_auth,
+    get_claude_code_auth_info,
+)
 from src.parameter_validator import ParameterValidator, CompatibilityReporter
 from src.session_manager import session_manager
 from src.tool_manager import tool_manager
@@ -324,6 +336,7 @@ claude_cli = ClaudeCodeCLI(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Verify Claude Code authentication and CLI on startup."""
+    claude_login.load_stored_token()
     logger.info("Verifying Claude Code authentication and CLI...")
 
     # Validate authentication first
@@ -405,14 +418,40 @@ app = FastAPI(
     description="OpenAI-compatible API for Claude Code",
     version="1.0.0",
     lifespan=lifespan,
+    # Default docs routes are disabled; protected replacements are registered below.
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
 )
+
+
+@app.get("/openapi.json", include_in_schema=False)
+async def openapi_schema(_: bool = Depends(verify_docs_access)):
+    return JSONResponse(app.openapi())
+
+
+@app.get("/docs", include_in_schema=False)
+async def swagger_ui(_: bool = Depends(verify_docs_access)):
+    return get_swagger_ui_html(
+        openapi_url="/openapi.json",
+        title=f"{app.title} - Swagger UI",
+        swagger_ui_parameters={"persistAuthorization": True},
+    )
+
+
+@app.get("/redoc", include_in_schema=False)
+async def redoc_ui(_: bool = Depends(verify_docs_access)):
+    return get_redoc_html(openapi_url="/openapi.json", title=f"{app.title} - ReDoc")
+
 
 # Configure CORS
 cors_origins = json.loads(os.getenv("CORS_ORIGINS", '["*"]'))
+# Credentials (cookies / auth headers) must never be combined with a wildcard origin.
+cors_allow_credentials = "*" not in cors_origins
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins,
-    allow_credentials=True,
+    allow_credentials=cors_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -446,7 +485,38 @@ class RequestSizeLimitMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next):
         content_length = request.headers.get("content-length")
-        if content_length and int(content_length) > MAX_REQUEST_SIZE:
+        if content_length is not None:
+            try:
+                declared_size = int(content_length)
+            except ValueError:
+                declared_size = -1
+            if declared_size < 0:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": {
+                            "message": "Invalid Content-Length header.",
+                            "type": "invalid_request",
+                            "code": 400,
+                        }
+                    },
+                )
+        elif "transfer-encoding" in request.headers:
+            # Chunked upload: the size cannot be checked up front. (Requests with neither
+            # Content-Length nor Transfer-Encoding have no body at all and are fine.)
+            return JSONResponse(
+                status_code=411,
+                content={
+                    "error": {
+                        "message": "Content-Length header required.",
+                        "type": "length_required",
+                        "code": 411,
+                    }
+                },
+            )
+        else:
+            declared_size = 0
+        if declared_size > MAX_REQUEST_SIZE:
             return JSONResponse(
                 status_code=413,
                 content={
@@ -480,7 +550,7 @@ class DebugLoggingMiddleware(BaseHTTPMiddleware):
 
         # Log basic request info with request ID for correlation
         logger.debug(f"🔍 [{request_id}] Incoming request: {request.method} {request.url}")
-        logger.debug(f"🔍 [{request_id}] Headers: {dict(request.headers)}")
+        logger.debug(f"🔍 [{request_id}] Headers: {redact_headers(request.headers)}")
 
         # For POST requests, try to log body (but don't break if we can't)
         body_logged = False
@@ -488,7 +558,7 @@ class DebugLoggingMiddleware(BaseHTTPMiddleware):
             try:
                 # Only attempt to read body if it's reasonable size and content-type
                 content_length = request.headers.get("content-length")
-                if content_length and int(content_length) < 100000:  # Less than 100KB
+                if content_length and content_length.isdigit() and int(content_length) < 100000:
                     body = await request.body()
                     if body:
                         try:
@@ -589,72 +659,89 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     return JSONResponse(status_code=422, content=error_response)
 
 
+def apply_tool_policy(claude_options: Dict[str, Any], enable_tools: bool) -> None:
+    """Tools are off unless the client explicitly asks for them."""
+    if enable_tools:
+        claude_options["allowed_tools"] = DEFAULT_ALLOWED_TOOLS
+        claude_options.pop("disallowed_tools", None)
+        # Headless API usage cannot answer permission prompts.
+        claude_options["permission_mode"] = "bypassPermissions"
+        logger.info(f"Tools enabled by client request: {DEFAULT_ALLOWED_TOOLS}")
+    else:
+        claude_options["disallowed_tools"] = CLAUDE_TOOLS
+        claude_options.pop("allowed_tools", None)
+        claude_options.pop("permission_mode", None)
+        claude_options["max_turns"] = 1  # Single turn for Q&A
+        logger.info("Tools disabled (default)")
+
+
+def prepare_chat_call(
+    request_body: ChatCompletionRequest, claude_headers: Dict[str, Any]
+) -> Tuple[Dict[str, Any], Optional[str]]:
+    """
+    Build the run_completion() arguments for a chat request.
+
+    Returns (run_kwargs, session_id). The user's prompt is passed through unchanged;
+    only Claude's *output* is filtered.
+    """
+    all_messages, session_id = session_manager.process_messages(
+        request_body.messages, request_body.session_id
+    )
+    logger.info(f"Chat completion: session_id={session_id}, total_messages={len(all_messages)}")
+
+    prompt, system_prompt = MessageAdapter.messages_to_prompt(all_messages)
+
+    sampling_instructions = request_body.get_sampling_instructions()
+    if sampling_instructions:
+        system_prompt = (
+            f"{system_prompt}\n\n{sampling_instructions}"
+            if system_prompt
+            else sampling_instructions
+        )
+        logger.debug(f"Added sampling instructions: {sampling_instructions}")
+
+    claude_options = request_body.to_claude_options()
+    claude_options.update(claude_headers)
+    if claude_options.get("model"):
+        ParameterValidator.validate_model(claude_options["model"])
+    apply_tool_policy(claude_options, bool(request_body.enable_tools))
+
+    run_kwargs = {
+        "prompt": prompt,
+        "system_prompt": system_prompt,
+        "model": claude_options.get("model"),
+        "max_turns": claude_options.get("max_turns", 10),
+        "allowed_tools": claude_options.get("allowed_tools"),
+        "disallowed_tools": claude_options.get("disallowed_tools"),
+        "permission_mode": claude_options.get("permission_mode"),
+    }
+    return run_kwargs, session_id
+
+
+def internal_error(request: Request, exc: Exception, context: str) -> HTTPException:
+    """Log the full error, return a generic one (no internals leak to clients)."""
+    request_id = getattr(request.state, "request_id", "unknown")
+    logger.exception(f"{context} [{request_id}]: {exc}")
+    return HTTPException(
+        status_code=500, detail=f"Internal server error (request id: {request_id})"
+    )
+
+
 async def generate_streaming_response(
-    request: ChatCompletionRequest, request_id: str, claude_headers: Optional[Dict[str, Any]] = None
+    request: ChatCompletionRequest,
+    request_id: str,
+    run_kwargs: Dict[str, Any],
+    actual_session_id: Optional[str],
 ) -> AsyncGenerator[str, None]:
     """Generate SSE formatted streaming response."""
+    prompt = run_kwargs["prompt"]
     try:
-        # Process messages with session management
-        all_messages, actual_session_id = session_manager.process_messages(
-            request.messages, request.session_id
-        )
-
-        # Convert messages to prompt
-        prompt, system_prompt = MessageAdapter.messages_to_prompt(all_messages)
-
-        # Add sampling instructions from temperature/top_p if present
-        sampling_instructions = request.get_sampling_instructions()
-        if sampling_instructions:
-            if system_prompt:
-                system_prompt = f"{system_prompt}\n\n{sampling_instructions}"
-            else:
-                system_prompt = sampling_instructions
-            logger.debug(f"Added sampling instructions: {sampling_instructions}")
-
-        # Filter content for unsupported features
-        prompt = MessageAdapter.filter_content(prompt)
-        if system_prompt:
-            system_prompt = MessageAdapter.filter_content(system_prompt)
-
-        # Get Claude Agent SDK options from request
-        claude_options = request.to_claude_options()
-
-        # Merge with Claude-specific headers if provided
-        if claude_headers:
-            claude_options.update(claude_headers)
-
-        # Validate model
-        if claude_options.get("model"):
-            ParameterValidator.validate_model(claude_options["model"])
-
-        # Handle tools - disabled by default for OpenAI compatibility
-        if not request.enable_tools:
-            # Disable all tools by using CLAUDE_TOOLS constant
-            claude_options["disallowed_tools"] = CLAUDE_TOOLS
-            claude_options["max_turns"] = 1  # Single turn for Q&A
-            logger.info("Tools disabled (default behavior for OpenAI compatibility)")
-        else:
-            # Enable tools - use default safe subset (Read, Glob, Grep, Bash, Write, Edit)
-            claude_options["allowed_tools"] = DEFAULT_ALLOWED_TOOLS
-            # Set permission mode to bypass prompts (required for API/headless usage)
-            claude_options["permission_mode"] = "bypassPermissions"
-            logger.info(f"Tools enabled by user request: {DEFAULT_ALLOWED_TOOLS}")
-
         # Run Claude Code
         chunks_buffer = []
         role_sent = False  # Track if we've sent the initial role chunk
         content_sent = False  # Track if we've sent any content
 
-        async for chunk in claude_cli.run_completion(
-            prompt=prompt,
-            system_prompt=system_prompt,
-            model=claude_options.get("model"),
-            max_turns=claude_options.get("max_turns", 10),
-            allowed_tools=claude_options.get("allowed_tools"),
-            disallowed_tools=claude_options.get("disallowed_tools"),
-            permission_mode=claude_options.get("permission_mode"),
-            stream=True,
-        ):
+        async for chunk in claude_cli.run_completion(**run_kwargs, stream=True):
             chunks_buffer.append(chunk)
 
             # Check if we have an assistant message
@@ -801,8 +888,13 @@ async def generate_streaming_response(
         yield "data: [DONE]\n\n"
 
     except Exception as e:
-        logger.error(f"Streaming error: {e}")
-        error_chunk = {"error": {"message": str(e), "type": "streaming_error"}}
+        logger.exception(f"Streaming error [{request_id}]: {e}")
+        error_chunk = {
+            "error": {
+                "message": f"Internal server error (request id: {request_id})",
+                "type": "streaming_error",
+            }
+        }
         yield f"data: {json.dumps(error_chunk)}\n\n"
 
 
@@ -840,10 +932,13 @@ async def chat_completions(
             compatibility_report = CompatibilityReporter.generate_compatibility_report(request_body)
             logger.debug(f"Compatibility report: {compatibility_report}")
 
+        run_kwargs, actual_session_id = prepare_chat_call(request_body, claude_headers)
+
         if request_body.stream:
-            # Return streaming response
             return StreamingResponse(
-                generate_streaming_response(request_body, request_id, claude_headers),
+                generate_streaming_response(
+                    request_body, request_id, run_kwargs, actual_session_id
+                ),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -851,69 +946,9 @@ async def chat_completions(
                 },
             )
         else:
-            # Non-streaming response
-            # Process messages with session management
-            all_messages, actual_session_id = session_manager.process_messages(
-                request_body.messages, request_body.session_id
-            )
-
-            logger.info(
-                f"Chat completion: session_id={actual_session_id}, total_messages={len(all_messages)}"
-            )
-
-            # Convert messages to prompt
-            prompt, system_prompt = MessageAdapter.messages_to_prompt(all_messages)
-
-            # Add sampling instructions from temperature/top_p if present
-            sampling_instructions = request_body.get_sampling_instructions()
-            if sampling_instructions:
-                if system_prompt:
-                    system_prompt = f"{system_prompt}\n\n{sampling_instructions}"
-                else:
-                    system_prompt = sampling_instructions
-                logger.debug(f"Added sampling instructions: {sampling_instructions}")
-
-            # Filter content
-            prompt = MessageAdapter.filter_content(prompt)
-            if system_prompt:
-                system_prompt = MessageAdapter.filter_content(system_prompt)
-
-            # Get Claude Agent SDK options from request
-            claude_options = request_body.to_claude_options()
-
-            # Merge with Claude-specific headers
-            if claude_headers:
-                claude_options.update(claude_headers)
-
-            # Validate model
-            if claude_options.get("model"):
-                ParameterValidator.validate_model(claude_options["model"])
-
-            # Handle tools - disabled by default for OpenAI compatibility
-            if not request_body.enable_tools:
-                # Disable all tools by using CLAUDE_TOOLS constant
-                claude_options["disallowed_tools"] = CLAUDE_TOOLS
-                claude_options["max_turns"] = 1  # Single turn for Q&A
-                logger.info("Tools disabled (default behavior for OpenAI compatibility)")
-            else:
-                # Enable tools - use default safe subset (Read, Glob, Grep, Bash, Write, Edit)
-                claude_options["allowed_tools"] = DEFAULT_ALLOWED_TOOLS
-                # Set permission mode to bypass prompts (required for API/headless usage)
-                claude_options["permission_mode"] = "bypassPermissions"
-                logger.info(f"Tools enabled by user request: {DEFAULT_ALLOWED_TOOLS}")
-
-            # Collect all chunks
+            prompt = run_kwargs["prompt"]
             chunks = []
-            async for chunk in claude_cli.run_completion(
-                prompt=prompt,
-                system_prompt=system_prompt,
-                model=claude_options.get("model"),
-                max_turns=claude_options.get("max_turns", 10),
-                allowed_tools=claude_options.get("allowed_tools"),
-                disallowed_tools=claude_options.get("disallowed_tools"),
-                permission_mode=claude_options.get("permission_mode"),
-                stream=False,
-            ):
+            async for chunk in claude_cli.run_completion(**run_kwargs, stream=False):
                 chunks.append(chunk)
 
             # Extract assistant message
@@ -957,8 +992,7 @@ async def chat_completions(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Chat completion error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise internal_error(request, e, "Chat completion error")
 
 
 @app.post("/v1/messages")
@@ -988,6 +1022,12 @@ async def anthropic_messages(
         }
         raise HTTPException(status_code=503, detail=error_detail)
 
+    if request_body.stream:
+        raise HTTPException(
+            status_code=400,
+            detail="Streaming is not supported on /v1/messages. Send the request with stream=false.",
+        )
+
     try:
         logger.info(f"Anthropic Messages API request: model={request_body.model}")
 
@@ -1005,21 +1045,24 @@ async def anthropic_messages(
         prompt = "\n\n".join(prompt_parts)
         system_prompt = request_body.system
 
-        # Filter content
-        prompt = MessageAdapter.filter_content(prompt)
-        if system_prompt:
-            system_prompt = MessageAdapter.filter_content(system_prompt)
+        # Tools (incl. Bash) only on explicit opt-in via X-Claude-Enable-Tools: true
+        enable_tools = request.headers.get("x-claude-enable-tools", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        claude_options: Dict[str, Any] = {"max_turns": 10}
+        apply_tool_policy(claude_options, enable_tools)
 
-        # Run Claude Code - tools enabled by default for Anthropic SDK clients
-        # (they're typically using this for agentic workflows)
         chunks = []
         async for chunk in claude_cli.run_completion(
             prompt=prompt,
             system_prompt=system_prompt,
             model=request_body.model,
-            max_turns=10,
-            allowed_tools=DEFAULT_ALLOWED_TOOLS,
-            permission_mode="bypassPermissions",
+            max_turns=claude_options["max_turns"],
+            allowed_tools=claude_options.get("allowed_tools"),
+            disallowed_tools=claude_options.get("disallowed_tools"),
+            permission_mode=claude_options.get("permission_mode"),
             stream=False,
         ):
             chunks.append(chunk)
@@ -1053,8 +1096,7 @@ async def anthropic_messages(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Anthropic Messages API error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise internal_error(request, e, "Anthropic Messages API error")
 
 
 @app.get("/v1/models")
@@ -1069,8 +1111,13 @@ async def list_models(
 
 
 @app.post("/v1/compatibility")
-async def check_compatibility(request_body: ChatCompletionRequest):
+async def check_compatibility(
+    request_body: ChatCompletionRequest,
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
     """Check OpenAI API compatibility for a request."""
+    await verify_api_key(request, credentials)
     report = CompatibilityReporter.generate_compatibility_report(request_body)
     return {
         "compatibility_report": report,
@@ -1716,6 +1763,12 @@ async def root():
                         </svg>
                         ReDoc
                     </a>
+                    <a href="/claude-login">
+                        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"/>
+                        </svg>
+                        Claude Login
+                    </a>
                 </nav>
             </footer>
         </main>
@@ -1727,8 +1780,11 @@ async def root():
 
 @app.post("/v1/debug/request")
 @rate_limit_endpoint("debug")
-async def debug_request_validation(request: Request):
+async def debug_request_validation(
+    request: Request, credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+):
     """Debug endpoint to test request validation and see what's being sent."""
+    await verify_api_key(request, credentials)
     try:
         # Get the raw request body
         body = await request.body()
@@ -1766,7 +1822,7 @@ async def debug_request_validation(request: Request):
 
         return {
             "debug_info": {
-                "headers": dict(request.headers),
+                "headers": redact_headers(request.headers),
                 "method": request.method,
                 "url": str(request.url),
                 "raw_body": raw_body,
@@ -1786,17 +1842,106 @@ async def debug_request_validation(request: Request):
         return {
             "debug_info": {
                 "error": f"Debug endpoint error: {str(e)}",
-                "headers": dict(request.headers),
+                "headers": redact_headers(request.headers),
                 "method": request.method,
                 "url": str(request.url),
             }
         }
 
 
+async def claude_login_access(request: Request) -> None:
+    """
+    Access check for the Claude login endpoints and the login page.
+
+    Accepts the API key as Bearer token (scripts) or HTTP Basic password (browser, like
+    /docs). Requests from other websites are rejected: a browser would attach cached
+    Basic credentials to them automatically.
+    """
+    await verify_docs_access(request)
+    origin = request.headers.get("origin")
+    if origin and urlparse(origin).netloc != request.headers.get("host"):
+        raise HTTPException(status_code=403, detail="Cross-origin request rejected")
+
+
+@app.get("/claude-login", response_class=HTMLResponse, include_in_schema=False)
+async def claude_login_page(_: None = Depends(claude_login_access)):
+    """Browser page for the Claude login (wraps the /v1/claude-login endpoints)."""
+    return HTMLResponse(
+        LOGIN_PAGE_HTML,
+        headers={
+            "Cache-Control": "no-store",
+            "X-Frame-Options": "DENY",
+            "Content-Security-Policy": "default-src 'self'; style-src 'unsafe-inline'; "
+            "script-src 'unsafe-inline'; frame-ancestors 'none'",
+        },
+    )
+
+
+@app.get("/v1/claude-login")
+@rate_limit_endpoint("auth")
+async def claude_login_status(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+    _: None = Depends(claude_login_access),
+):
+    """Show where the Claude OAuth token comes from and whether a login is running."""
+    return claude_login.status()
+
+
+@app.post("/v1/claude-login/start")
+@rate_limit_endpoint("auth")
+async def claude_login_start(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+    _: None = Depends(claude_login_access),
+):
+    """Step 1: start the Claude subscription login and get the URL to open in a browser."""
+    try:
+        url = await claude_login.start_login()
+    except claude_login.LoginError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    return {
+        "authorize_url": url,
+        "next_step": "Open the URL, sign in, copy the code shown and send it to "
+        'POST /v1/claude-login/complete as {"code": "..."} within 10 minutes.',
+    }
+
+
+@app.post("/v1/claude-login/complete")
+@rate_limit_endpoint("auth")
+async def claude_login_complete(
+    body: ClaudeLoginCompleteRequest,
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+    _: None = Depends(claude_login_access),
+):
+    """Step 2: hand the code from the browser to the CLI; the token is stored and activated."""
+    try:
+        await claude_login.complete_login(body.code)
+    except claude_login.LoginError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"status": "logged_in", **claude_login.status()}
+
+
+@app.delete("/v1/claude-login")
+@rate_limit_endpoint("auth")
+async def claude_login_logout(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+    _: None = Depends(claude_login_access),
+):
+    """Remove the token stored by an API login."""
+    removed = await claude_login.logout()
+    return {"removed": removed, **claude_login.status()}
+
+
 @app.get("/v1/auth/status")
 @rate_limit_endpoint("auth")
-async def get_auth_status(request: Request):
+async def get_auth_status(
+    request: Request, credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+):
     """Get Claude Code authentication status."""
+    await verify_api_key(request, credentials)
     from src.auth import auth_manager
 
     auth_info = get_claude_code_auth_info()
@@ -1818,9 +1963,11 @@ async def get_auth_status(request: Request):
 
 @app.get("/v1/sessions/stats")
 async def get_session_stats(
+    request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
     """Get session manager statistics."""
+    await verify_api_key(request, credentials)
     stats = session_manager.get_stats()
     return {
         "session_stats": stats,
@@ -1830,17 +1977,23 @@ async def get_session_stats(
 
 
 @app.get("/v1/sessions")
-async def list_sessions(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)):
+async def list_sessions(
+    request: Request, credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+):
     """List all active sessions."""
+    await verify_api_key(request, credentials)
     sessions = session_manager.list_sessions()
     return SessionListResponse(sessions=sessions, total=len(sessions))
 
 
 @app.get("/v1/sessions/{session_id}")
 async def get_session(
-    session_id: str, credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+    session_id: str,
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
     """Get information about a specific session."""
+    await verify_api_key(request, credentials)
     session = session_manager.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -1850,9 +2003,12 @@ async def get_session(
 
 @app.delete("/v1/sessions/{session_id}")
 async def delete_session(
-    session_id: str, credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+    session_id: str,
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
     """Delete a specific session."""
+    await verify_api_key(request, credentials)
     deleted = session_manager.delete_session(session_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -2109,6 +2265,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
         content={
             "error": {"message": exc.detail, "type": "api_error", "code": str(exc.status_code)}
         },
+        headers=getattr(exc, "headers", None),
     )
 
 

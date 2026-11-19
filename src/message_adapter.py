@@ -1,4 +1,4 @@
-from typing import List, Optional, Dict, Any
+from typing import List, Optional
 from src.models import Message
 import re
 
@@ -97,18 +97,6 @@ class MessageAdapter:
             return "I understand you're testing the system. How can I help you today?"
 
         return content
-
-    @staticmethod
-    def format_claude_response(
-        content: str, model: str, finish_reason: str = "stop"
-    ) -> Dict[str, Any]:
-        """Format Claude response for OpenAI compatibility."""
-        return {
-            "role": "assistant",
-            "content": content,
-            "finish_reason": finish_reason,
-            "model": model,
-        }
 
     @staticmethod
     def estimate_tokens(text: str) -> int:

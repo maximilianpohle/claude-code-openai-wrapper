@@ -604,38 +604,6 @@ class TestClaudeCodeCLIRunCompletion:
             assert captured_options[0].permission_mode == "acceptEdits"
 
     @pytest.mark.asyncio
-    async def test_run_completion_continue_session(self, cli_instance):
-        """run_completion sets continue_session option."""
-        mock_message = {"type": "assistant"}
-        captured_options = []
-
-        async def mock_query(prompt, options):
-            captured_options.append(options)
-            yield mock_message
-
-        with patch("src.claude_cli.query", mock_query):
-            async for _ in cli_instance.run_completion("Hello", continue_session=True):
-                pass
-
-            assert captured_options[0].continue_session is True
-
-    @pytest.mark.asyncio
-    async def test_run_completion_resume_session(self, cli_instance):
-        """run_completion sets resume option for session_id."""
-        mock_message = {"type": "assistant"}
-        captured_options = []
-
-        async def mock_query(prompt, options):
-            captured_options.append(options)
-            yield mock_message
-
-        with patch("src.claude_cli.query", mock_query):
-            async for _ in cli_instance.run_completion("Hello", session_id="sess-123"):
-                pass
-
-            assert captured_options[0].resume == "sess-123"
-
-    @pytest.mark.asyncio
     async def test_run_completion_converts_objects_to_dicts(self, cli_instance):
         """run_completion converts message objects to dicts."""
         # Create a mock object with attributes

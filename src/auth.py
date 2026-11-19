@@ -1,6 +1,9 @@
 import os
+import base64
+import binascii
+import hmac
 import logging
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, Mapping
 from fastapi import HTTPException, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
@@ -178,7 +181,12 @@ class ClaudeCodeAuthManager:
             "errors": [],
             "config": {
                 "method": "Claude Code CLI authentication",
-                "note": "Using existing Claude Code CLI authentication",
+                "oauth_token_present": bool(os.getenv("CLAUDE_CODE_OAUTH_TOKEN")),
+                "note": (
+                    "Using CLAUDE_CODE_OAUTH_TOKEN"
+                    if os.getenv("CLAUDE_CODE_OAUTH_TOKEN")
+                    else "Using existing Claude Code CLI login (~/.claude)"
+                ),
             },
         }
 
@@ -251,8 +259,8 @@ async def verify_api_key(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # Verify the API key
-    if credentials.credentials != active_api_key:
+    # Verify the API key (constant-time comparison to avoid timing side channels)
+    if not _keys_match(credentials.credentials, active_api_key):
         raise HTTPException(
             status_code=401,
             detail="Invalid API key",
@@ -260,6 +268,59 @@ async def verify_api_key(
         )
 
     return True
+
+
+def _keys_match(provided: Optional[str], expected: str) -> bool:
+    """Constant-time comparison of a provided key against the expected key."""
+    if not provided:
+        return False
+    return hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))
+
+
+async def verify_docs_access(request: Request) -> bool:
+    """
+    Protect the interactive docs (/docs, /redoc, /openapi.json) when an API key is set.
+
+    Browsers cannot send a Bearer header when simply opening a URL, so HTTP Basic
+    auth is accepted as well: any username, the API key as password. A Bearer
+    header with the API key also works (e.g. for scripted access to /openapi.json).
+    """
+    active_api_key = auth_manager.get_api_key()
+    if not active_api_key:
+        return True
+
+    auth_header = request.headers.get("authorization", "")
+    scheme, _, value = auth_header.partition(" ")
+    scheme = scheme.lower()
+    value = value.strip()
+
+    if scheme == "bearer" and _keys_match(value, active_api_key):
+        return True
+
+    if scheme == "basic" and value:
+        try:
+            decoded = base64.b64decode(value, validate=True).decode("utf-8")
+        except (binascii.Error, UnicodeDecodeError):
+            decoded = ""
+        _, sep, password = decoded.partition(":")
+        if sep and _keys_match(password, active_api_key):
+            return True
+
+    raise HTTPException(
+        status_code=401,
+        detail="Authentication required",
+        headers={"WWW-Authenticate": 'Basic realm="API Docs", charset="UTF-8"'},
+    )
+
+
+SENSITIVE_HEADERS = frozenset(
+    {"authorization", "proxy-authorization", "cookie", "set-cookie", "x-api-key"}
+)
+
+
+def redact_headers(headers: Mapping[str, str]) -> Dict[str, str]:
+    """Return a copy of the headers with credentials masked (for logs/debug output)."""
+    return {k: ("[REDACTED]" if k.lower() in SENSITIVE_HEADERS else v) for k, v in headers.items()}
 
 
 def validate_claude_code_auth() -> Tuple[bool, Dict[str, Any]]:

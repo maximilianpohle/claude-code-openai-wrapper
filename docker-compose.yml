@@ -3,14 +3,24 @@ services:
   claude-wrapper:
     build: .
     ports:
-      - "8000:8000"
+      # Only reachable from this machine. To expose it on the network, set API_KEY
+      # (any self-chosen secret, e.g. `openssl rand -hex 32`) and use "8000:8000".
+      - "127.0.0.1:8000:8000"
     volumes:
-      - ~/.claude:/root/.claude
+      # Token from the API login (POST /v1/claude-login/start + /complete)
+      - claude-auth:/home/app/.claude-wrapper
       # Optional: Mount a specific workspace directory
-      # Uncomment and modify the line below to use a custom workspace
       # - ./workspace:/workspace
     environment:
       - PORT=8000
+      # Claude login: either via the API (see README), or set a token from
+      # `claude setup-token` as CLAUDE_CODE_OAUTH_TOKEN in ./.env (gitignored)
+      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}
+      # Optional: protect the API with a self-chosen secret (clients send it as Bearer token)
+      - API_KEY=${API_KEY:-}
       # Optional: Set Claude's working directory (defaults to isolated temp dir)
       # Uncomment and modify the line below to set a custom working directory
       # - CLAUDE_CWD=/workspace
+
+volumes:
+  claude-auth:

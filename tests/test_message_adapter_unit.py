@@ -253,34 +253,6 @@ class TestFilterContent:
         assert "How can I help you today?" in result
 
 
-class TestFormatClaudeResponse:
-    """Test MessageAdapter.format_claude_response()"""
-
-    def test_basic_formatting(self):
-        """Basic response formatting."""
-        result = MessageAdapter.format_claude_response(content="Hello!", model="claude-3-opus")
-
-        assert result["role"] == "assistant"
-        assert result["content"] == "Hello!"
-        assert result["model"] == "claude-3-opus"
-        assert result["finish_reason"] == "stop"
-
-    def test_custom_finish_reason(self):
-        """Can specify custom finish_reason."""
-        result = MessageAdapter.format_claude_response(
-            content="Hello!", model="claude-3", finish_reason="length"
-        )
-
-        assert result["finish_reason"] == "length"
-
-    def test_preserves_content_exactly(self):
-        """Content is preserved exactly as provided."""
-        content = 'Multi\nline\ncontent with special chars: <>&"'
-        result = MessageAdapter.format_claude_response(content=content, model="claude")
-
-        assert result["content"] == content
-
-
 class TestEstimateTokens:
     """Test MessageAdapter.estimate_tokens()"""
 
