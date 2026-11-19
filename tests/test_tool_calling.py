@@ -131,6 +131,49 @@ class TestForcedFunction:
         assert _post(client, tools=[SCHEMA_TOOL], tool_choice=FORCED).status_code == 502
 
 
+class TestModelWritesTextInsteadOfToolCall:
+    """The CLI demands the StructuredOutput tool; models sometimes answer with plain JSON."""
+
+    def test_json_text_recovered_after_cli_gave_up(self, client, monkeypatch):
+        answer = {
+            "tool_calls": [
+                {"name": "generate_insights_and_discoveries", "arguments": {"insights": []}}
+            ]
+        }
+
+        async def fake_run_completion(**kwargs):
+            yield {"model": "claude-x", "content": [{"type": "text", "text": json.dumps(answer)}]}
+            # hook feedback of the CLI (a user message, no "model")
+            yield {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "[structured-output-enforce] You MUST call the StructuredOutput tool",
+                    }
+                ]
+            }
+            yield {"type": "result", "subtype": "error_during_execution", "is_error": True}
+
+        monkeypatch.setattr(main.claude_cli, "run_completion", fake_run_completion)
+        r = _post(client, tools=[SCHEMA_TOOL], tool_choice=FORCED)
+        assert r.status_code == 200
+        assert r.json()["choices"][0]["finish_reason"] == "tool_calls"
+
+    def test_assistant_texts_skip_hook_messages(self):
+        from src.claude_cli import ClaudeCodeCLI
+
+        messages = [
+            {"model": "m", "content": [{"type": "text", "text": "A"}]},
+            {"content": [{"type": "text", "text": "hook"}]},
+            {"model": "m", "content": [{"type": "text", "text": "B"}]},
+        ]
+        assert ClaudeCodeCLI.assistant_texts(messages) == ["A", "B"]
+
+    def test_instructions_name_structured_output_tool(self):
+        spec = tool_calling.build_tool_spec([SCHEMA_TOOL], FORCED)
+        assert "StructuredOutput" in spec.instructions
+
+
 class TestAutoChoice:
     def test_plain_answer(self, client, claude):
         claude.structured = {"content": "Es sind 20 Grad."}
@@ -224,3 +267,21 @@ class TestValidation:
 def test_build_tool_spec_without_tools():
     assert tool_calling.build_tool_spec(None, None) is None
     assert tool_calling.build_tool_spec([WEATHER_TOOL], "none") is None
+
+
+class TestDebugDump:
+    def test_dump_files_written_only_when_enabled(self, client, claude, tmp_path, monkeypatch):
+        claude.structured = {
+            "tool_calls": [{"name": "get_weather", "arguments": {"city": "Berlin"}}]
+        }
+        _post(client, tools=[WEATHER_TOOL])
+        assert list(tmp_path.iterdir()) == []
+
+        monkeypatch.setenv("DEBUG_DUMP_DIR", str(tmp_path))
+        r = _post(client, tools=[WEATHER_TOOL])
+        assert r.status_code == 200
+        suffixes = {p.name.split("_", 2)[2] for p in tmp_path.iterdir()}
+        assert suffixes == {"request.json", "claude-input.json", "claude-output.json"}
+        request_file = next(p for p in tmp_path.iterdir() if p.name.endswith("_request.json"))
+        assert json.loads(request_file.read_text())["tools"][0]["function"]["name"] == "get_weather"
+        assert oct(request_file.stat().st_mode & 0o777) == "0o600"

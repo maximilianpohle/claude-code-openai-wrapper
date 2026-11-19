@@ -221,6 +221,25 @@ class ClaudeCodeCLI:
 
         return last_text
 
+    @staticmethod
+    def assistant_texts(messages: List[Dict[str, Any]]) -> List[str]:
+        """Text of every assistant message, in order (user/hook messages are skipped)."""
+        texts = []
+        for message in messages:
+            # Assistant messages carry the model name; user messages (incl. CLI hook
+            # feedback such as "You MUST call the StructuredOutput tool") do not.
+            if not message.get("model") or not isinstance(message.get("content"), list):
+                continue
+            parts = [
+                block.text if hasattr(block, "text") else block.get("text", "")
+                for block in message["content"]
+                if hasattr(block, "text")
+                or (isinstance(block, dict) and block.get("type") == "text")
+            ]
+            if parts:
+                texts.append("\n".join(parts))
+        return texts
+
     def extract_metadata(self, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Extract metadata like costs, tokens, and session info from SDK messages."""
         metadata = {

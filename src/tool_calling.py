@@ -114,6 +114,8 @@ def _build_instructions(tools: List[Dict[str, Any]], required: bool) -> str:
         "You have access to the following functions. You cannot run them yourself: to use",
         "one, put a call into your structured answer; the caller executes it and sends",
         "the result back as a message with role 'tool'.",
+        "Deliver your final answer ONLY by calling the StructuredOutput tool with the",
+        "object described below. Do not write the answer as plain text.",
         "",
     ]
     for tool in tools:
@@ -150,7 +152,10 @@ def _extract_json(text: str) -> Any:
 
 
 def parse_response(
-    structured_output: Any, text: Optional[str], spec: ToolSpec
+    structured_output: Any,
+    text: Optional[str],
+    spec: ToolSpec,
+    assistant_texts: Optional[List[str]] = None,
 ) -> Tuple[Optional[str], List[Dict[str, Any]]]:
     """
     Translate Claude's answer into (content, tool_calls) of an OpenAI message.
@@ -159,9 +164,14 @@ def parse_response(
     text. Plain text without any call is returned as content when calls are optional.
     """
     data = structured_output if isinstance(structured_output, dict) else None
-    if data is None and text:
-        parsed = _extract_json(text)
-        data = parsed if isinstance(parsed, dict) else None
+    if data is None:
+        # Newest first: the model may have written the JSON as plain text instead of
+        # calling the StructuredOutput tool (the CLI then asks again and may give up).
+        for candidate in [*reversed(assistant_texts or []), text or ""]:
+            parsed = _extract_json(candidate) if candidate else None
+            if isinstance(parsed, dict) and ("tool_calls" in parsed or "content" in parsed):
+                data = parsed
+                break
 
     raw_calls = (data or {}).get("tool_calls") or []
     tool_calls = []

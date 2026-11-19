@@ -47,6 +47,7 @@ from src.models import (
 from src.claude_cli import ClaudeCodeCLI
 from src import claude_login
 from src import tool_calling
+from src import debug_dump
 from src.login_page import LOGIN_PAGE_HTML
 from src.message_adapter import MessageAdapter
 from src.auth import (
@@ -724,7 +725,7 @@ def prepare_chat_call(
     apply_tool_policy(claude_options, bool(request_body.enable_tools) and not tool_spec)
     if tool_spec:
         # Structured output may need one more turn than a plain answer
-        claude_options["max_turns"] = 3
+        claude_options["max_turns"] = 5
 
     run_kwargs = {
         "prompt": prompt,
@@ -741,10 +742,30 @@ def prepare_chat_call(
     return run_kwargs, session_id, tool_spec
 
 
+async def log_chat_request(request: Request, body: ChatCompletionRequest, request_id: str) -> None:
+    """Debug aid: one-line summary (DEBUG_MODE) and full raw body (DEBUG_DUMP_DIR)."""
+    if logger.isEnabledFor(logging.DEBUG):
+        roles = [
+            f"{m.role}:{len(m.content) if isinstance(m.content, str) else 0}" for m in body.messages
+        ]
+        tools = [t.get("function", {}).get("name") for t in body.tools or []]
+        logger.debug(
+            f"[{request_id}] chat request: model={body.model} stream={body.stream} "
+            f"messages={roles} tools={tools} tool_choice={body.tool_choice!r}"
+        )
+    if debug_dump.enabled():
+        try:
+            raw = json.loads((await request.body()) or b"{}")
+        except ValueError:
+            raw = {"unparsable_body": True}
+        debug_dump.dump(request_id, "request", raw)
+
+
 async def run_tool_call(
-    run_kwargs: Dict[str, Any], tool_spec: tool_calling.ToolSpec
+    run_kwargs: Dict[str, Any], tool_spec: tool_calling.ToolSpec, request_id: str = "unknown"
 ) -> Tuple[Optional[str], List[Dict[str, Any]]]:
     """Run Claude and translate its structured answer into (content, tool_calls)."""
+    debug_dump.dump(request_id, "claude-input", run_kwargs)
     chunks = []
     async for chunk in claude_cli.run_completion(**run_kwargs, stream=False):
         chunks.append(chunk)
@@ -752,10 +773,31 @@ async def run_tool_call(
         (c["structured_output"] for c in chunks if c.get("structured_output") is not None), None
     )
     text = claude_cli.parse_claude_message(chunks)
+    assistant_texts = claude_cli.assistant_texts(chunks)
+    debug_dump.dump(
+        request_id,
+        "claude-output",
+        {
+            "structured_output": structured,
+            "result": text,
+            "assistant_texts": assistant_texts,
+            "messages": chunks,
+        },
+    )
     try:
-        return tool_calling.parse_response(structured, text, tool_spec)
+        content, tool_calls = tool_calling.parse_response(
+            structured, text, tool_spec, assistant_texts
+        )
+        logger.debug(
+            f"[{request_id}] function calling result: {len(tool_calls)} tool call(s), "
+            f"content={'yes' if content else 'no'}, structured_output={structured is not None}"
+        )
+        return content, tool_calls
     except tool_calling.ToolCallingError as e:
-        logger.warning(f"Function calling failed: {e}. Claude answered: {(text or '')[:300]!r}")
+        logger.warning(
+            f"Function calling failed: {e}. structured_output={structured is not None}, "
+            f"assistant texts={[t[:300] for t in assistant_texts]!r}, result={(text or '')[:300]!r}"
+        )
         raise HTTPException(status_code=502, detail=str(e))
 
 
@@ -777,7 +819,7 @@ async def generate_tool_streaming_response(
         return f"data: {chunk.model_dump_json()}\n\n"
 
     try:
-        content, tool_calls = await run_tool_call(run_kwargs, tool_spec)
+        content, tool_calls = await run_tool_call(run_kwargs, tool_spec, request_id)
         if tool_calls:
             yield sse({"role": "assistant", "content": None})
             for index, call in enumerate(tool_calls):
@@ -1015,6 +1057,7 @@ async def chat_completions(
             compatibility_report = CompatibilityReporter.generate_compatibility_report(request_body)
             logger.debug(f"Compatibility report: {compatibility_report}")
 
+        await log_chat_request(request, request_body, request_id)
         run_kwargs, actual_session_id, tool_spec = prepare_chat_call(request_body, claude_headers)
 
         if tool_spec and request_body.stream:
@@ -1026,7 +1069,7 @@ async def chat_completions(
                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
             )
         if tool_spec:
-            content, tool_calls = await run_tool_call(run_kwargs, tool_spec)
+            content, tool_calls = await run_tool_call(run_kwargs, tool_spec, request_id)
             if actual_session_id:
                 session_manager.add_assistant_response(
                     actual_session_id,

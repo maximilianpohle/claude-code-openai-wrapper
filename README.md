@@ -406,6 +406,25 @@ volumes:
 
 Run: `docker-compose up -d` | Stop: `docker-compose down`
 
+### Debugging
+
+To see what a client really sends (and what Claude answers):
+
+```bash
+DEBUG_MODE=true DEBUG_DUMP_DIR=/tmp/wrapper-debug docker compose up -d
+# ... reproduce the request, then:
+docker compose logs claude-wrapper | grep -E "chat request|function calling|Function calling failed"
+docker compose cp claude-wrapper:/tmp/wrapper-debug ./wrapper-debug
+```
+
+- `DEBUG_MODE=true`: one log line per chat request (model, stream, message roles and sizes,
+  tool names, `tool_choice`) and the outcome of function calling.
+- `DEBUG_DUMP_DIR`: one JSON file per request (`*_request.json` = the full body as sent by
+  the client) and, for function calling, `*_claude-input.json` / `*_claude-output.json` (what
+  went to Claude and its raw answer). `Authorization` headers are never written.
+
+Dumps contain prompts and answers - possibly sensitive data. Delete them afterwards.
+
 ### Environment Variables
 
 | Variable | Description | Default |
